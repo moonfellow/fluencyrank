@@ -27,15 +27,13 @@ PEOPLE_CROPS_DIR = GENEALOGY_DIR / "person_crops"
 PEOPLE_CROPS_CSV = GENEALOGY_DIR / "person_crops.csv"
 PERSON_SCORES_CSV = GENEALOGY_DIR / "person_genealogy_scores.csv"
 ANON_SALT_FILE   = GENEALOGY_DIR / ".anon_salt"
+# sons/wives counts from the genealogy xls (scores csv blanks 0 sons)
+PERSON_WIVES_CSV = GENEALOGY_DIR / "person_wives.csv"
 
-# pair design. new pairs either link two separate parts of the comparison
-# graph (so one scale can be fitted) or contrast a person trait the
-# analysis tests (experiments/human_fluency_traits.py), size-matched so box
-# size does not do the work. raters never see any of this.
-CONTRAST_TRAITS = ("scribe", "own_hand", "has_title")
+# new pairs link graph components or contrast a tested trait, size-matched
+CONTRAST_TRAITS = ("scribe", "own_hand", "has_title", "has_sons", "has_wife")
 CONTRAST_SHARE  = 0.5
-# every REPEAT_EVERY-th pair a rater sees is one someone else already judged,
-# for agreement; the rest are new
+# every REPEAT_EVERY-th pair is a repeat, for agreement
 REPEAT_EVERY    = 10
 PAIR_RNG        = np.random.default_rng(42)
 
@@ -95,8 +93,15 @@ class Corpus:
 
     def __init__(self):
         self.items = self.load_items()
+        if "active" not in self.items.columns:
+            self.items["active"] = True
         self.by_id = {r["item_id"]: r for _, r in self.items.iterrows()}
         self.traits = item_traits(self.items)
+
+    @property
+    def active_ids(self):
+        """crops usable for new pairs and single ratings"""
+        return set(self.items.loc[self.items["active"], "item_id"])
 
     def load_items(self):
         raise NotImplementedError
@@ -194,14 +199,17 @@ class AnonCorpus(Corpus):
 
     def load_items(self):
         df = pd.concat([SOURCE_LOADERS[s]() for s in self.sources], ignore_index=True)
-        if self.one_per_person:
-            df = one_crop_each(df)
         df = group_duplicate_ink(df)
 
         salt = load_anon_salt()
         df["anon_id"] = [anon_id(salt, k) for k in df["key"]]
         if not df["anon_id"].is_unique:
             raise SystemExit("anon id collision -- two crops hashed alike")
+
+        if self.one_per_person:
+            df = one_crop_each(df, self.judged_counts())
+        else:
+            df["active"] = True
 
         df = self.cap_pool(df)
 
@@ -213,39 +221,36 @@ class AnonCorpus(Corpus):
             num = lambda c: pd.to_numeric(df[c], errors="coerce")
             df["area"] = (num("x1") - num("x0")) * (num("y1") - num("y0"))
         extra = [c for c in ("genealogy_code", "area") if c in df.columns]
-        return df[["item_id", "group_id", "crop_path", "source"]
+        return df[["item_id", "group_id", "crop_path", "source", "active"]
                   + extra + self.id_cols]
 
-    def judged_ids(self):
-        """anon ids that already appear in a comparison, so a smaller pool
-        never orphans work already done."""
-        ids = set()
-        for path in [self.master_csv] + sorted(
-                OUT_DIR.glob(f"{self.prefix}_pairwise_*.csv")):
-            if not path.exists():
-                continue
-            d = pd.read_csv(path, encoding="utf-8-sig")
+    def judged_counts(self):
+        """anon id -> use count over comparisons, judgements and ratings"""
+        counts = Counter()
+        if self.master_csv.exists():
+            d = pd.read_csv(self.master_csv, encoding="utf-8-sig")
             for col in ("a_anon_id", "b_anon_id"):
                 if col in d.columns:
-                    ids |= set(d[col].dropna().astype(str))
+                    counts.update(d[col].dropna().astype(str))
+        for path in sorted(OUT_DIR.glob(f"{self.prefix}_pairwise_*.csv")):
+            d = pd.read_csv(path, encoding="utf-8-sig")
+            if "human_margin" not in d.columns:
+                continue
+            d = d[d["human_margin"].notna()]
+            for col in ("a_anon_id", "b_anon_id"):
+                if col in d.columns:
+                    counts.update(d[col].dropna().astype(str))
         for path in sorted(OUT_DIR.glob(f"{self.prefix}_labels_*.csv")):
             d = pd.read_csv(path, encoding="utf-8-sig")
             if "anon_id" in d.columns and "human_fluency" in d.columns:
-                ids |= set(d.loc[d["human_fluency"].notna(), "anon_id"].astype(str))
-        return ids
+                counts.update(d.loc[d["human_fluency"].notna(), "anon_id"].astype(str))
+        return counts
+
+    def judged_ids(self):
+        return set(self.judged_counts())
 
     def cap_pool(self, df):
-        """hold the pool to --limit crops.
-
-        a ranking only becomes a scale once the comparison graph connects, and
-        with thousands of crops the coverage-balancing generator keeps drawing
-        unseen ones, so every pair stays an island. a smaller pool is what makes
-        the same judgement budget connect.
-
-        kept regardless of the cap: crops already judged (dropping them would
-        strand those judgements). the rest is filled per source in the
-        existing proportions,
-        on a fixed seed so the pool is the same on every restart."""
+        """cap pool at --limit so the comparison graph connects. judged crops always kept; rest sampled per source, fixed seed."""
         if self.limit is None or len(df) <= self.limit:
             return df
 
@@ -269,7 +274,6 @@ class AnonCorpus(Corpus):
                 picked.append(pool.sample(n=n, random_state=int(rng.integers(1 << 31))))
         out = pd.concat([held] + picked, ignore_index=True) if picked else held
 
-        # rounding can land a crop or two short of the cap
         if len(out) < self.limit:
             spare = rest[~rest["anon_id"].isin(set(out["anon_id"]))]
             if len(spare):
@@ -306,9 +310,7 @@ class AllCorpus(AnonCorpus):
 CORPORA = {c.name: c for c in (CoreCorpus, PeopleCorpus, AllCorpus)}
 
 
-# hosted copy (PythonAnywhere). the pool is frozen at export time so the
-# server needs none of the genealogy data: no salt, no names, no anon map,
-# just crops renamed to their anon id plus precomputed pairing traits.
+# hosted copy: frozen pool, crops renamed to anon id, no genealogy data
 BUNDLE_POOL   = "pool.csv"
 BUNDLE_CROPS  = "crops"
 TRAIT_COLS    = ("log_area",) + CONTRAST_TRAITS
@@ -321,7 +323,10 @@ class FrozenCorpus(PeopleCorpus):
         pool = pd.read_csv(self.root / BUNDLE_POOL, encoding="utf-8-sig")
         pool["crop_path"] = [str(self.root / BUNDLE_CROPS / f"{a}.png")
                              for a in pool["anon_id"]]
-        self.items = pool[["item_id", "group_id", "crop_path", "source"]
+        if "active" not in pool.columns:
+            pool["active"] = True
+        pool["active"] = pool["active"].astype(str).str.lower().isin(("true", "1"))
+        self.items = pool[["item_id", "group_id", "crop_path", "source", "active"]
                           + self.id_cols].copy()
         self.by_id = {r["item_id"]: r for _, r in self.items.iterrows()}
         self.traits = pool.set_index("item_id")[
@@ -329,17 +334,14 @@ class FrozenCorpus(PeopleCorpus):
 
 
 def export_bundle(corpus, out):
-    """write what the hosted server needs to `out`: code, the pool with
-    traits, crops named by anon id, and the current people_* rating files
-    (not the anon map)."""
+    """write hosted bundle: code, pool with traits, crops, rating csvs (no anon map)"""
     out = Path(out)
     (out / BUNDLE_CROPS).mkdir(parents=True, exist_ok=True)
     (out / OUT_DIR).mkdir(parents=True, exist_ok=True)
 
     items = corpus.items
-    pool = items[["item_id", "group_id", "source"] + corpus.id_cols].copy()
-    # group ids carry the genealogy code; hash them so the bundle holds no
-    # person identifiers. only equality matters to the pair generator.
+    pool = items[["item_id", "group_id", "source", "active"] + corpus.id_cols].copy()
+    # hash group ids so the bundle holds no person ids
     salt = load_anon_salt()
     pool["group_id"] = [anon_id(salt, "group:" + str(g)) for g in pool["group_id"]]
     t = corpus.traits.reindex(pool["item_id"])
@@ -416,25 +418,19 @@ def load_signature_source():
                 "sig_id", "contract_id", "x0", "y0", "x1", "y1"]]
 
 
-def one_crop_each(df):
-    """keep a single crop per person: the largest, on the grounds that the
-    biggest box is the least likely to be a clipped fragment.
-
-    every comparison then puts two different hands side by side, which is what
-    the ranking is actually asking about -- with several crops per person the
-    generator could otherwise spend judgements on one hand against itself, and
-    a person with 133 crops would crowd out one with a single crop."""
-    if "group_id" not in df.columns:
-        return df
+def one_crop_each(df, judged):
+    """one active crop per person: most-used, else largest box. other judged crops kept as retired; unjudged extras dropped."""
     df = df.copy()
     df["_area"] = (pd.to_numeric(df["x1"], errors="coerce")
                    - pd.to_numeric(df["x0"], errors="coerce")) * \
                   (pd.to_numeric(df["y1"], errors="coerce")
                    - pd.to_numeric(df["y0"], errors="coerce"))
-    df = (df.sort_values("_area", ascending=False)
-            .drop_duplicates("group_id", keep="first")
-            .drop(columns="_area"))
-    return df.reset_index(drop=True)
+    df["_used"] = [judged.get(a, 0) for a in df["anon_id"]]
+    df = df.sort_values(["_used", "_area", "anon_id"],
+                        ascending=[False, False, True])
+    df["active"] = ~df.duplicated("group_id", keep="first")
+    df = df[df["active"] | (df["_used"] > 0)]
+    return df.drop(columns=["_area", "_used"]).reset_index(drop=True)
 
 
 SOURCE_LOADERS = {"person": load_person_source, "signature": load_signature_source}
@@ -528,9 +524,7 @@ def existing_pairs_from(master):
 
 
 def item_traits(items):
-    """per-crop pairing covariates: log box area, and the person traits in
-    CONTRAST_TRAITS (1 held, 0 never, NaN unknown). roles come from the
-    contract rosters, so a person with no roster roles is unknown, not 0."""
+    """log box area plus CONTRAST_TRAITS (1/0/NaN unknown)"""
     t = pd.DataFrame(index=pd.Index(items["item_id"], name="item_id"))
     area = pd.to_numeric(items["area"], errors="coerce").to_numpy() \
         if "area" in items.columns else np.full(len(items), np.nan)
@@ -549,6 +543,12 @@ def item_traits(items):
     for fam in ("scribe", "own_hand"):
         t[fam] = [float(fam in held[c]) if c in held else np.nan for c in codes]
     t["has_title"] = pd.Series(codes).map(g["has_title"]).to_numpy(dtype=float)
+
+    if PERSON_WIVES_CSV.exists():
+        w = pd.read_csv(PERSON_WIVES_CSV, encoding="utf-8-sig").set_index("genealogy_code")
+        for trait, col in (("has_sons", "n_sons_xls"), ("has_wife", "n_wives")):
+            n = pd.Series(codes).map(w[col]).astype(float)
+            t[trait] = (n > 0).astype(float).where(n.notna()).to_numpy()
     return t
 
 
@@ -569,18 +569,7 @@ def graph_components(ids, pairs):
 
 
 def generate_new_pairs(existing_pairs, n_needed):
-    """returns [(a, b, kind, trait)].
-
-    the old generator always paired the two least-seen crops, so while unseen
-    crops were left every pair was two fresh crops: 213 islands, no shared
-    scale. now each pair takes the least-seen crop and gives it a partner from
-    a *different* component of the comparison graph, so every pair merges two
-    components until the graph is one piece; after that it just balances
-    exposure.
-
-    CONTRAST_SHARE of pairs are trait contrasts: a holder of the trait with
-    the fewest contrasting pairs so far, against a known non-holder whose box
-    size is as close as possible."""
+    """[(a, b, kind, trait)]. least-seen crop vs partner from another graph component; CONTRAST_SHARE are size-matched trait contrasts."""
     items = CORPUS.items
     ids = list(items["item_id"])
     groups = dict(zip(ids, items["group_id"]))
@@ -590,8 +579,11 @@ def generate_new_pairs(existing_pairs, n_needed):
     degree = Counter(i for pair in existing_pairs for i in pair)
     comp = graph_components(ids, existing_pairs)
 
-    usable = [t for t in CONTRAST_TRAITS if t in traits.columns
-              and (traits[t] == 1).any() and (traits[t] == 0).any()]
+    # retired crops count in degree/components but never get new pairs
+    active = [i for i in ids if i in CORPUS.active_ids]
+    act = traits.loc[traits.index.isin(active)]
+    usable = [t for t in CONTRAST_TRAITS if t in act.columns
+              and (act[t] == 1).any() and (act[t] == 0).any()]
     trait_of = {t: traits[t].to_dict() for t in usable}
     contrasts = Counter()
     for pair in existing_pairs:
@@ -611,11 +603,11 @@ def generate_new_pairs(existing_pairs, n_needed):
         if usable and PAIR_RNG.random() < CONTRAST_SHARE:
             kind = "contrast"
             trait = min(usable, key=lambda t: (contrasts[t], PAIR_RNG.random()))
-            a_pool = [i for i in ids if trait_of[trait][i] == 1]
-            b_pool = [i for i in ids if trait_of[trait][i] == 0]
+            a_pool = [i for i in active if trait_of[trait][i] == 1]
+            b_pool = [i for i in active if trait_of[trait][i] == 0]
         else:
             kind, trait = "link", ""
-            a_pool = b_pool = ids
+            a_pool = b_pool = active
 
         a = min(a_pool, key=lambda i: (degree[i], PAIR_RNG.random()))
         partners = [b for b in b_pool
@@ -631,7 +623,7 @@ def generate_new_pairs(existing_pairs, n_needed):
             return same + degree[b] + PAIR_RNG.random()
 
         b = min(partners, key=cost)
-        if PAIR_RNG.random() < 0.5:      # holder is not always on the left
+        if PAIR_RNG.random() < 0.5:
             a, b = b, a
 
         existing_pairs.add(frozenset((a, b)))
@@ -657,7 +649,6 @@ def log_design(rows):
 
 
 def judgement_counts():
-    """judgements per comparison, over every rater file"""
     counts = Counter()
     for path in OUT_DIR.glob(f"{CORPUS.prefix}_pairwise_*.csv"):
         d = pd.read_csv(path, encoding="utf-8-sig")
@@ -666,9 +657,7 @@ def judgement_counts():
     return counts
 
 
-# in-memory, per rater: the pair last handed out (so a reload shows the same
-# pair) and pairs cleared by undo (so "back" brings the previous pair back).
-# lost on restart, which only means a fresh pair is served.
+# per rater: pair last served, and undone pairs. lost on restart
 SERVED = {}
 UNDONE = {}
 
@@ -690,10 +679,7 @@ def load_rater_pairwise(name, master):
 
 
 def pick_existing(name, open_ids, n_judged):
-    """an existing comparison this rater still has open, or None to make a new
-    one. order: a pair they just undid, the pair they were last shown, a pair
-    nobody has judged yet (and nobody else is looking at), then on every
-    REPEAT_EVERY-th turn the least-judged, newest pair for agreement."""
+    """open pair to reuse, or None: undone, last served, unjudged, then every REPEAT_EVERY-th a repeat"""
     stack = UNDONE.get(name, [])
     while stack:
         cid = stack.pop()
@@ -739,7 +725,6 @@ def next_pair_for(name):
                     ignore_index=True)
                 write_csv(rater_df, CORPUS.pairwise_csv(name))
             elif open_ids:
-                # pool exhausted: fall back to any open pair
                 counts = judgement_counts()
                 cid = min(open_ids, key=lambda c: (counts[c], -c))
             else:
@@ -759,9 +744,7 @@ def save_margin(name, comparison_id, margin):
 
 
 def clear_margin(name, comparison_id):
-    """undo one comparison. the pair stays in the master and in this rater's
-    file, only the margin goes back to blank, so next_pair_for hands the same
-    comparison out again rather than generating a fresh one."""
+    """blank the margin so the same pair is served again"""
     with CSV_LOCK:
         master = load_master()
         rater_df = load_rater_pairwise(name, master)
@@ -787,9 +770,7 @@ def load_raters():
 
 
 def get_profile(name):
-    """what this rater told us about themselves, or None if they have not been
-    through the intake yet. a name is the only thing asked for, so any saved
-    row counts as done."""
+    """intake row, or None if not done"""
     df = load_raters()
     row = df[df["rater"] == name]
     if row.empty:
@@ -799,9 +780,7 @@ def get_profile(name):
 
 
 def clean_profile(body):
-    """validate one intake submission. only the name is required, and that is
-    the rater key rather than a field here -- everything below is optional, so
-    a blank is always an acceptable answer."""
+    """validate intake; all fields optional"""
     fam = body.get("chinese_familiarity")
     if fam in (None, "", "null"):
         fam = ""
@@ -865,10 +844,12 @@ def load_rater_labels(name):
 
 def next_single_for(name):
     rater_df = load_rater_labels(name)
-    unrated = rater_df[rater_df["human_fluency"].isna()]
+    # retired crops kept so their ratings survive rewrites, never served
+    unrated = rater_df[rater_df["human_fluency"].isna()
+                       & rater_df["item_id"].isin(CORPUS.active_ids)]
     n_judged = int(rater_df["human_fluency"].notna().sum())
     if unrated.empty:
-        return None, len(rater_df), n_judged
+        return None, int(rater_df["item_id"].isin(CORPUS.active_ids).sum()), n_judged
     return unrated.iloc[0].to_dict(), len(rater_df), n_judged
 
 
@@ -881,8 +862,6 @@ def save_score(name, example_id, score):
 
 
 def clear_score(name, example_id):
-    """undo one rating. blanking human_fluency is enough: next_single_for
-    serves the first unrated row, so the crop comes straight back."""
     with CSV_LOCK:
         rater_df = load_rater_labels(name)
         rater_df.loc[rater_df["example_id"] == example_id, "human_fluency"] = np.nan
@@ -998,8 +977,6 @@ PAGE = """<!doctype html>
   .choices button.flash { background: var(--accent); color: var(--accent-ink); }
 
   .hint { color: var(--faint); font-size: 12px; margin-top: 18px; }
-  /* deliberately quieter than the answer buttons: undo is the rare path and
-     should not compete with the five choices for a misclick of its own. */
   .backrow { margin-top: 22px; }
   .back { background: var(--btn); color: var(--ink); border: 1px solid transparent;
         border-radius: 3px; padding: 6px 14px; font-family: inherit;
@@ -1010,8 +987,6 @@ PAGE = """<!doctype html>
   .done { font-size: 15px; margin-top: 60px; }
 
   .goal { display: flex; align-items: center; gap: 8px; font-size: 13px; white-space: nowrap; }
-  /* the image tiles along the bar at its own proportions; progress covers
-     it in solid lime from the left as the count climbs toward the milestone. */
   .goal { --bar-w: 280px; --bar-h: 16px; }
   .goal .bar { display: block; flex: none; box-sizing: content-box;
         width: var(--bar-w); height: var(--bar-h);
@@ -1041,8 +1016,6 @@ PAGE = """<!doctype html>
     .pair { gap: 14px; margin-bottom: 20px; }
     .side img { width: 40vw; }
     .single img { width: 62vw; }
-    /* both answer sets stay in one row, low-to-high or A-side to B-side, so
-       the order reads the same way it does on a wide screen. */
     .choices, .choices.compare { flex-direction: row; flex-wrap: nowrap; align-items: stretch; gap: 4px; }
     .choices button, .choices.compare button { flex: 1 1 0; min-width: 0; width: auto; min-height: 64px;
           padding: 8px 3px; font-size: 11.5px; line-height: 1.25; white-space: normal; }
@@ -1107,10 +1080,7 @@ PAGE = """<!doctype html>
 let rater = localStorage.getItem("fluency_rater") || "";
 let mode = "rank";
 let current = null;
-// ids this rater has answered in this sitting, newest last, one stack per mode.
-// undo pops the top and blanks it on the server, which puts that item straight
-// back in front of them. the stacks are per-visit: a reload starts empty, so
-// undo never reaches back into work from an earlier session.
+// per-visit undo stacks, one per mode
 let history = {rank: [], rate: []};
 
 const statsEl = document.getElementById("stats");
@@ -1191,7 +1161,6 @@ async function refreshStats() {
   const res = await fetch(`/api/session?rater=${encodeURIComponent(rater)}`);
   const d = await res.json();
   if (d.profile) profile = d.profile;
-  // the milestone counts both modes together, so either one gets you there.
   const total = d.rank_judged + d.rate_judged;
   const pct = Math.min(100, total / MILESTONE * 100);
   statsEl.innerHTML = `<span class="goal"><span class="bar"><span class="fill" style="width:${pct}%"></span></span>` +
@@ -1202,8 +1171,7 @@ async function refreshStats() {
 const MILESTONE = 100;
 let milestoneShown = false;
 
-// shown once per rater per browser; the flag lives in localStorage so a
-// reload or undo-and-redo around 100 does not bring it back.
+// milestone shown once per rater per browser
 function showMilestone() {
   const key = `fluency_milestone_${rater}`;
   if (milestoneShown || localStorage.getItem(key)) return;
@@ -1216,7 +1184,6 @@ function showMilestone() {
       <div class="msg">Thank you for completing 100 ratings! In return for your hard work, please take an early Qing bronze coin, casted (hypothetically) in 1651 in Beijing under the Shunzhi Emperor with a composition of 60% copper, 20% lead, and 20% zinc.</div>
       <button class="close">close <span class="zh">关闭</span></button>
     </div>`;
-  // if the image file goes missing, fall back to the message alone
   box.querySelector("img").onerror = e => e.target.remove();
   box.querySelector(".close").onclick = () => box.remove();
   document.body.appendChild(box);
@@ -1232,12 +1199,8 @@ async function loadNext() {
   if (mode === "rank") await loadPair(); else await loadSingle();
 }
 
-// the back button is rendered even when nothing is left to answer, otherwise a
-// misclick on the very last item would have no way back.
+// back button always drawn, disabled when nothing to undo
 function backHtml(which) {
-  // always drawn, so it reads as part of the furniture rather than something
-  // that appears out of nowhere after the first answer. it is simply disabled
-  // when there is nothing in this sitting left to take back.
   const off = history[which].length ? "" : " disabled";
   return '<div class="backrow"><button class="back" id="backBtn"' + off + '>' +
          '&larr; back<span class="zh">返回</span></button></div>';
@@ -1364,12 +1327,9 @@ async function undoScore() {
 document.addEventListener("keydown", e => {
   const t = document.activeElement;
   if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
-  // the milestone popup must be closed with its button; until then, answer
-  // and undo keys should not act on the pair hidden behind it.
+  // keys inactive while the milestone popup is open
   if (document.querySelector(".milestone")) return;
-  // backspace is handled before the `current` guard: on the "nothing left to
-  // answer" screen current is null, and that is exactly when someone who has
-  // just misclicked the final item needs to get back to it.
+  // backspace before the current guard so the last item can be undone
   if (e.key === "Backspace") {
     e.preventDefault();
     if (mode === "rank") undoMargin(); else undoScore();
@@ -1377,7 +1337,6 @@ document.addEventListener("keydown", e => {
   }
   if (!current) return;
   if (mode === "rank" && ["1","2","3","4","5"].includes(e.key)) {
-    // keyed in the order the buttons appear on screen, A much ... B much
     const margins = {"1": 4, "2": 2, "3": 0, "4": -2, "5": -4};
     submitMargin(margins[e.key]);
   } else if (mode === "rate" && ["0","1","2","3","4"].includes(e.key)) {
@@ -1423,8 +1382,7 @@ STATIC_WEBP = ("intro_scale.webp", "progress_bar.webp", "milestone.webp")
 
 
 def route(method, raw_path, body_bytes=b""):
-    """one request -> (status, content type, body). shared by the local
-    http.server Handler and the WSGI app (fluency_wsgi.py) PythonAnywhere runs."""
+    """request -> (status, content type, body); used by local server and WSGI"""
     parsed = urlparse(raw_path)
     path = unquote(parsed.path)
 
@@ -1538,8 +1496,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-browser", action="store_true",
                         help="serve without opening a browser window")
     parser.add_argument("--one-per-person", action="store_true",
-                        help="keep only the largest crop for each person, so "
-                             "every comparison is between two different hands")
+                        help="one active crop per person: their most-judged "
+                             "crop, else the largest. other already-judged "
+                             "crops are kept but retired from new pairs")
     parser.add_argument("--limit", type=int, default=None,
                         help="hold the pool to this many crops (anonymised "
                              "corpora only). already-judged crops are always "

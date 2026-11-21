@@ -1,24 +1,9 @@
-# role vocabulary for the contract rosters.
-#
-# database/processed/people.csv gives every named party a role string, comma
-# separated when one person holds several. the vocabulary is open: ~1700
-# distinct tokens over 22k rows, most of them one-offs, and it mixes
-# orthographies (traditional/simplified, 場/塲/场, 憑/凴/凭, 戶/户) with
-# scribal typos the transcribers kept in brackets (在傷[場]).
-#
-# so the tokens are matched by pattern, not enumerated. ROLE_FAMILIES groups
-# them into the functional roles the analysis cares about; SUBTYPES splits the
-# three families that are worth reading in detail. order matters in both:
-# the first pattern that hits wins for subtypes, and own_hand is tested before
-# scribe so 親筆 ("in his own hand") is not swept in with 代筆.
-#
-# coverage on the plausible-match roster is ~99% of role tokens. the residue
-# is one-off kin terms and oddities (營業者, 天開公嗣孫).
+# role vocabulary, matched by pattern (open, mixed orthography). order matters: first subtype hit wins,
+# own_hand tested before scribe so 親筆 isn't taken as 代筆.
 
 import re
 
-# (key, label, pattern). a token may belong to several families: "兄,買人"
-# is kin and buyer, and 在場憑中 is one witness token, not two.
+# (key, label, pattern); a token may fall in several families
 ROLE_FAMILIES = [
     ("own_hand", "親筆",
      r"親筆|亲笔|親書|亲书"),
@@ -49,9 +34,7 @@ ROLE_FAMILIES = [
 
 FOCUS_FAMILIES = ["scribe", "witness", "initiator"]
 
-# per-family subtypes, first match wins. the initiator patterns are ordered by
-# how specific the transaction verb is: 立杜找断截田契人 is a 找 (supplementary
-# payment on an earlier sale), not a 賣, so 找 is tested before 賣.
+# subtypes, first match wins; 找 before 賣
 SUBTYPES = {
     "scribe": [
         ("dictated", "依口代筆", r"依口"),

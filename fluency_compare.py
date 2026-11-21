@@ -1,48 +1,4 @@
-'''
-human fluency scoring, step 1 of 2: HUMAN INPUT ONLY.
-
-instead of a human assigning an absolute 0-3 label to one signature at a
-time (see ml_fluency_supervised.py), this pairs signatures up and asks a
-human which of the two is more fluent, and by how much. paired/comparative
-judgements are usually more consistent than absolute ones, and the graded
-margin gives a continuous scale for free once aggregated.
-
-supports multiple independent raters (see RATERS below). every rater judges
-the exact same fixed-size set of pairs (TOTAL_PAIRS, spread across as many
-distinct signatures as that budget allows), but each gets their own CSV
-with no visibility into anyone else's answers -- so send a rater the sheets
-plus *only* their own CSV. two benefits: more comparisons feeding the
-aggregate score, and human_fluency_cluster.py can report how much the
-raters agree.
-
-judge each pair on:
-  - variation of line width (thinnest stroke vs thickest stroke)
-  - tortuosity (how winding the strokes are)
-  - total stroke length (flowing connected ink vs short choppy marks)
-  - evenness of size (consistent character/stroke sizing)
-  - moderation of stroke weight (not too heavy/blotchy, not too faint/timid
-    -- either extreme suggests unfamiliarity with the brush)
-(this rubric isn't printed on the sheets themselves -- pass it along
-separately, e.g. in the email to raters.)
-
-this script only builds the pairs, renders comparison sheets, and writes/
-merges each rater's CSV. it does no scoring, aggregation, feature
-extraction, or clustering -- that's human_fluency_cluster.py, run once at
-least one rater's human_margin values are filled in.
-
-# inputs:
-# signatures/scqyN_signatures.csv
-# signatures/core/scqyN_colCC_sigSS.png
-# fluency/fluency_pairwise.csv               (optional, master pair list)
-# fluency/fluency_pairwise_<rater>.csv        (optional, previous judgements)
-
-# outputs:
-# fluency/fluency_pairwise_sheet_PP.png       (paginated side-by-side pairs,
-#                                                  shared by every rater)
-# fluency/fluency_pairwise.csv                (master pair list, no answers)
-# fluency/fluency_pairwise_<rater>.csv        (one per name in RATERS, each
-#                                                  with its own human_margin)
-'''
+'''human fluency step 1: build signature pairs, render sheets, write one blind CSV per rater. scoring is human_fluency_cluster.py.'''
 
 from collections import Counter
 from pathlib import Path
@@ -55,8 +11,6 @@ SIGNATURES_DIR = Path("signatures")
 CORE_DIR       = SIGNATURES_DIR / "core"
 OUT_DIR        = Path("fluency")
 
-# who's judging -- add/remove names here. each gets their own CSV, blind to
-# the others, all built from the same underlying set of pairs.
 RATERS = ["mackenzie", "christoph"]
 
 MASTER_CSV = OUT_DIR / "fluency_pairwise.csv"
@@ -69,8 +23,8 @@ def rater_csv(name):
 PAIR_THUMB     = 220
 PAIRS_PER_PAGE = 6
 
-SHEET_PAGES = 8                            # fixed batch size
-TOTAL_PAIRS = PAIRS_PER_PAGE * SHEET_PAGES  # 48 -- fills all 8 pages exactly
+SHEET_PAGES = 8
+TOTAL_PAIRS = PAIRS_PER_PAGE * SHEET_PAGES
 
 MAX_PAIRING_ROUNDS = 20
 
@@ -101,11 +55,7 @@ def sig_key(row):
 
 
 def generate_new_pairs(df, existing_pairs, total_pairs):
-    # existing_pairs: set of frozenset({key_a, key_b}) already in the CSV.
-    # fills up to total_pairs total (existing + new), each round preferring
-    # whichever signatures have the fewest comparisons so far, so a small
-    # fixed budget still spreads across as much of the corpus as it can
-    # rather than repeatedly reusing the same handful of signatures
+    # fill to total_pairs, least-compared signatures first
     lookup = {sig_key(row): row for _, row in df.iterrows()}
     ids = list(lookup.keys())
 
@@ -187,12 +137,7 @@ if __name__ == "__main__":
     if MASTER_CSV.exists():
         master = pd.read_csv(MASTER_CSV)[["comparison_id"] + key_cols]
 
-        # a pair made before a later manual-review pass rejected one of its
-        # two signatures now points at a crop that's gone -- drop it rather
-        # than crash trying to render it. safe as long as no rater has
-        # judged it yet; a judged stale pair is dropped too since there's
-        # nothing left to show it against, but that shouldn't come up in
-        # practice (review happens before comparisons are judged)
+        # drop pairs whose crop was rejected later
         valid = master.apply(
             lambda r: core_path_for(r.a_stem, r.a_column_id, r.a_sig_id).exists() and
                       core_path_for(r.b_stem, r.b_column_id, r.b_sig_id).exists(),
@@ -229,7 +174,6 @@ if __name__ == "__main__":
     master = pd.concat([master, pd.DataFrame(new_rows)], ignore_index=True)
     master = master.sort_values("comparison_id").reset_index(drop=True)
 
-    # crop paths for rendering only -- not saved to any CSV
     render_df = master.copy()
     render_df["a_crop_path"] = render_df.apply(
         lambda r: str(core_path_for(r.a_stem, r.a_column_id, r.a_sig_id)), axis=1)

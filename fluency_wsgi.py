@@ -1,13 +1,4 @@
-"""WSGI entry for the hosted fluency game (PythonAnywhere).
-
-runs fluency_game.route() against a bundle made by
-    python fluency_game.py --corpus people --limit 500 --export deploy_bundle
-with this file's folder as the bundle root. ratings land in fluency/ here;
-pull them back with sync_hosted_game.py.
-
-PythonAnywhere runs one worker process for a free web app, so the in-process
-CSV_LOCK in fluency_game is enough to serialise writes.
-"""
+"""WSGI entry for the hosted game. one worker, so CSV_LOCK serialises writes."""
 import os
 import sys
 from pathlib import Path
@@ -37,7 +28,7 @@ def application(environ, start_response):
         body = environ["wsgi.input"].read(length) if length else b""
     try:
         status, ctype, data = game.route(method, path, body)
-    except Exception as exc:  # keep one bad request from looking like an outage
+    except Exception as exc:
         print(f"error on {method} {path}: {exc!r}", file=sys.stderr)
         status, ctype, data = 500, "text/plain", b"server error"
     start_response(STATUS.get(status, f"{status} Error"),
